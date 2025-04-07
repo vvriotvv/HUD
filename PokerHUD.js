@@ -23,7 +23,15 @@ const pokerData = {
     revealedPlayers: new Set(),
     wtsdCountedThisHand: new Set(),
     GameID: null,
+    bbPlayerName: null,
+    bbPlayerID: null,
+    bbAmount: null,
+    sbPlayerName: null,
+    sbPlayerID: null,
+    sbAmount: null,
 };
+
+const blindPosts = [];
 
 const db = new Dexie("PokerHUD");
 db.version(1).stores({
@@ -64,14 +72,17 @@ db.version(1).stores({
 
                 // Route based on event type
                 switch (message.eventType) {
+                    case "getState":
+                        handleGetState(message);
+                        break;
                     case "playerMakeMove":
                         break;
                     case "chat": {
                         const chat = message.data;
-                        if (chat.meta === "action") {
+                        if (chat.meta === "action" || chat.meta === "won") {
+                            handlePlayerAction(message);
                         } else if (chat.meta === "state") {
                             handleGameState(message);
-                        } else if (chat.meta === "won") {
                         }
                     }
                         break;
@@ -103,6 +114,225 @@ db.version(1).stores({
     window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
 })();
 
+function handleGetState(messageobj) {
+    //console.log(messageobj);
+
+    if (messageobj.hand) {
+        const hand = messageobj?.hand;
+
+        if (!hand || !Array.isArray(hand)) {
+            console.warn("No hand data found.");
+            return;
+        }
+
+        const valueMap = {
+            "14": "A",
+            "13": "K",
+            "12": "Q",
+            "11": "J"
+        };
+
+        const formattedHand = hand.map(card => {
+            const [suit, value] = card.split("-");
+            const displayValue = valueMap[value] || value;
+            return `${displayValue}${suit}`; // e.g., "Kspades"
+        });
+
+        pokerData.myCards = formattedHand;
+        console.log("My Cards:", formattedHand.join(", "));
+    }
+
+    if (messageobj.players && typeof messageobj.players === "object") {
+
+        for (const player of Object.values(messageobj.players)) {
+            const { userID, playername } = player;
+            if (!userID || !playername) continue;
+
+            pokerData.players[userID] = {
+                name: playername,
+                money: null,
+                actions: []
+            };
+
+            pokerData.seatedPlayerIDs.push(userID);
+        }
+
+        console.log("Seated players:", pokerData.seatedPlayerIDs.map(id => pokerData.players[id].name).join(", "));
+
+        for (const blind of blindPosts) {
+            const player = Object.values(pokerData.players).find(p => p.name === blind.playerName);
+            if (!player) continue;
+
+            player.actions.push({
+                type: `posted ${blind.type} blind`,
+                amount: blind.amount,
+                round: pokerData.round || "Round 1",
+                timestamp: Date.now()
+            });
+            
+            player.money = (player.money || 0) - blind.amount;
+
+            if (blind.type === "small") {
+                pokerData.sbPlayerName = player.name;
+                pokerData.sbAmount = blind.amount;
+            } else if (blind.type === "big") {
+                pokerData.bbPlayerName = player.name;
+                pokerData.bbAmount = blind.amount;
+            }
+
+            console.log(`${player.name} posted ${blind.type} blind: -${blind.amount}`);
+        }
+
+        // Clear the queue after applying
+        blindPosts.length = 0;
+    }
+
+    updateHUDDisplay();
+}
+
+
+
+function handlePlayerAction(messageObj) {
+    const chatData = messageObj.data;
+    const message = chatData.message;
+    const author = chatData.author;
+    const userID = chatData.userID;
+
+    if (pokerData.GameID === null) {
+        return;
+    }
+    if (chatData.meta.includes("action")) {
+
+        if (message.includes("posted small blind")) {
+            const playerName = chatData.author;
+            const match = message.match(/\$([\d,]+)/);
+            const amount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            blindPosts.push({
+                type: "small",
+                playerName,
+                amount
+            });
+        }
+
+        if (message.includes("posted big blind")) {
+            const playerName = chatData.author;
+            const match = message.match(/\$([\d,]+)/);
+            const amount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            blindPosts.push({
+                type: "big",
+                playerName,
+                amount
+            });
+        }
+
+        if (message.includes("raised $")) {
+            const playerName = chatData.author;
+            const match = message.match(/to\s+\$([\d,]+)/i);
+            const raiseTo = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "raise",
+                    amount: raiseTo,
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+
+                playerEntry.money = (playerEntry.money || 0) - raiseTo;
+
+                console.log(`${playerName} raised to $${raiseTo}`);
+            }
+        }
+
+        if (message.includes("called $")) {
+            const playerName = chatData.author;
+            const match = message.match(/\$([\d,]+)/);
+            const calledAmount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "called",
+                    amount: calledAmount,
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+
+                playerEntry.money = (playerEntry.money || 0) - calledAmount;
+                console.log(`${playerName} called $${calledAmount}`);
+            }
+        }
+
+        if (message.includes("bet $")) {
+            const playerName = chatData.author;
+            const match = message.match(/\$([\d,]+)/);
+            const betAmount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "bet",
+                    amount: betAmount,
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+
+                playerEntry.money = (playerEntry.money || 0) - betAmount;
+                console.log(`${playerName} bet $${betAmount}`);
+            }
+        }
+
+        if (message.includes("folded")) {
+            const playerName = chatData.author;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "folded",
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+                console.log(`${playerName} folded`);
+            }
+        }
+
+        if (message.includes("checked")) {
+            const playerName = chatData.author;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "checked",
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+                console.log(`${playerName} checked`);
+            }
+        }
+    } else if (chatData.meta.includes("won")) {
+        if (message.includes("won $")) {
+            const playerName = chatData.author;
+            const match = message.match(/\$([\d,]+)/);
+            const amount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.actions.push({
+                    type: "won",
+                    amount: amount,
+                    round: pokerData.round,
+                    timestamp: Date.now()
+                });
+
+                playerEntry.money = (playerEntry.money || 0) + amount;
+                console.log(`${playerName} won $${amount}`);
+            }
+        }
+    }
+}
 
 function handleGameState(messageObj) {
     const chatData = messageObj.data;
@@ -127,12 +357,6 @@ function handleGameState(messageObj) {
     if (message.includes("Two cards dealt to each player")) {
         pokerData.round = "Round 1";
         console.log(`[${pokerData.round}] Two cards dealt to each player`);
-        setTimeout(() => {
-            const myCards = getMyHoleCardsFormatted();
-            pokerData.myCards = myCards;
-            console.log("My Cards:", myCards.join(", "));
-            updateHUDDisplay();
-        }, 500); // allow render time
         updateHUDDisplay();
         return;
     }
@@ -164,39 +388,10 @@ function handleGameState(messageObj) {
     console.log(`[${pokerData.round}] ${author}| Cards: ${pokerData.communityCards.join(", ")}`);
 }
 
-function getMyHoleCardsFormatted() {
-    const playerArea = document.querySelector("[class*='playerMeGateway']");
-    if (!playerArea) return [];
-
-    const cardElements = playerArea.querySelectorAll("div[class*='front'] > div");
-    const cards = Array.from(cardElements).map(e => {
-        const classList = Array.from(e.classList);
-
-        // Look for class that matches "suit-value" (e.g., diamonds-8___xyz)
-        const raw = classList.find(cls => /^(hearts|spades|clubs|diamonds)-\d+/.test(cls));
-        if (!raw) return null;
-
-        const match = raw.match(/(hearts|spades|clubs|diamonds)-(\d+)/);
-        if (!match) return null;
-
-        const [, suit, valueRaw] = match;
-
-        let value = valueRaw;
-        value = value.replace("14", "A")
-                     .replace("13", "K")
-                     .replace("12", "Q")
-                     .replace("11", "J");
-
-        return `${value}${suit}`; // e.g., "Khearts"
-    }).filter(Boolean);
-
-    return cards;
-}
-
-
-
 // Refresh Data for new round
 function clearGameState() {
+    logPlayerActions();
+
     pokerData.hands = [];
     pokerData.round = null;
     pokerData.lastRaisePlayerID = null;
@@ -209,9 +404,43 @@ function clearGameState() {
     pokerData.allowTracking = false;
     pokerData.revealedPlayers = new Set();
     pokerData.wtsdCountedThisHand = new Set();
+    pokerData.sbAmount = null;
+    pokerData.sbPlayerName = null;
+    pokerData.sbPlayerID = null;
+    pokerData.bbAmount = null;
+    pokerData.bbPlayerName = null;
+    pokerData.bbPlayerID = null;
+    pokerData.players = {};
+
+    blindPosts.length = 0;
 
     console.log("🔄 Game State Cleared");
 }
+
+function logPlayerActions() {
+    console.log("🔍 Player Actions This Hand:");
+
+    pokerData.seatedPlayerIDs.forEach(userID => {
+        const player = pokerData.players[userID];
+        if (!player) return;
+
+        console.log(`🧑 ${player.name}:`);
+
+        if (!player.actions || player.actions.length === 0) {
+            console.log("   • No actions recorded.");
+            return;
+        }
+
+        player.actions.forEach(action => {
+            const time = new Date(action.timestamp).toLocaleTimeString();
+            const amount = action.amount !== undefined ? ` $${action.amount.toLocaleString()}` : '';
+            console.log(`   • [${action.round}] ${action.type}${amount} @ ${time}`);
+        });
+    });
+
+    console.log("──────────────────────────────");
+}
+
 
 // Function to download pokerData as JSON
 function downloadPokerData() {
