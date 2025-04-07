@@ -9,20 +9,14 @@
 // ==/UserScript==
 
 const pokerData = {
-    hands: [],
     players: {},
     round: null,
-    lastRaisePlayerID: null,
-    handInProgress: false,
     seatedPlayerIDs: [],
-    lastPlayerStates: {},
     activePlayerIDs: [],
     communityCards: [],
     myCards: [],
-    allowTracking: false,
-    revealedPlayers: new Set(),
-    wtsdCountedThisHand: new Set(),
     GameID: null,
+    TableID: null,
     bbPlayerName: null,
     bbPlayerID: null,
     bbAmount: null,
@@ -68,6 +62,7 @@ db.version(1).stores({
 
                 const message = data?.result?.data?.data?.message;
                 //console.log("WebSocket parsed:", data);
+                pokerData.TableID = data?.result?.channel;
                 if (!message) return;
 
                 // Route based on event type
@@ -151,6 +146,7 @@ function handleGetState(messageobj) {
             pokerData.players[userID] = {
                 name: playername,
                 money: null,
+                vpipThisHand: false,
                 actions: []
             };
 
@@ -243,6 +239,10 @@ function handlePlayerAction(messageObj) {
 
                 playerEntry.money = (playerEntry.money || 0) - raiseTo;
 
+                if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
+                    playerEntry.vpipThisHand = true;
+                }                
+
                 console.log(`${playerName} raised to $${raiseTo}`);
             }
         }
@@ -262,6 +262,11 @@ function handlePlayerAction(messageObj) {
                 });
 
                 playerEntry.money = (playerEntry.money || 0) - calledAmount;
+
+                if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
+                    playerEntry.vpipThisHand = true;
+                }
+                
                 console.log(`${playerName} called $${calledAmount}`);
             }
         }
@@ -281,6 +286,11 @@ function handlePlayerAction(messageObj) {
                 });
 
                 playerEntry.money = (playerEntry.money || 0) - betAmount;
+
+                if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
+                    playerEntry.vpipThisHand = true;
+                }
+                
                 console.log(`${playerName} bet $${betAmount}`);
             }
         }
@@ -392,18 +402,13 @@ function handleGameState(messageObj) {
 function clearGameState() {
     logPlayerActions();
 
-    pokerData.hands = [];
     pokerData.round = null;
-    pokerData.lastRaisePlayerID = null;
-    pokerData.handInProgress = false;
+    pokerData.GameID = null;
+    pokerData.TableID = null;
     pokerData.seatedPlayerIDs = [];
-    pokerData.lastPlayerStates = {};
     pokerData.activePlayerIDs = [];
     pokerData.communityCards = [];
     pokerData.myCards = [];
-    pokerData.allowTracking = false;
-    pokerData.revealedPlayers = new Set();
-    pokerData.wtsdCountedThisHand = new Set();
     pokerData.sbAmount = null;
     pokerData.sbPlayerName = null;
     pokerData.sbPlayerID = null;
