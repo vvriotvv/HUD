@@ -17,6 +17,7 @@ const pokerData = {
     myCards: [],
     GameID: null,
     TableID: null,
+    TableName: null,
     bbPlayerName: null,
     bbPlayerID: null,
     bbAmount: null,
@@ -29,9 +30,8 @@ const blindPosts = [];
 
 const db = new Dexie("PokerHUD");
 db.version(1).stores({
-    players: "&id, name, handsPlayed",
+    players: "&id, name, handsPlayed, vpipHands, pfrHands, netProfit, lastPlayed, GameID, TableID, [id+TableID]"
 });
-
 
 (function () {
     'use strict';
@@ -54,15 +54,25 @@ db.version(1).stores({
                 const msg = event.data;
                 if (!isJsonString(msg)) return; // First, skip if it's not JSON
                 const data = JSON.parse(msg);
-                const channel = data?.result?.channel;
+                const channel = data?.push?.channel;
                 if (!channel || !channel.startsWith('holdem')) // Ensure channel exists and starts with 'holdem'
                 {
                     return;
                 }
 
-                const message = data?.result?.data?.data?.message;
+                const message = data?.push?.pub?.data?.message;
                 //console.log("WebSocket parsed:", data);
-                pokerData.TableID = data?.result?.channel;
+                if (channel.startsWith('holdem') && !channel.includes('lobby')) {
+                    pokerData.TableID = channel.replace(/\D+/g, '');
+                }
+                                if (channel.includes('holdemlobby')) {
+                    const tables = data?.push?.pub?.data?.message?.tables;
+                    const tableId = Number(pokerData.TableID); 
+                
+                    const matchingTable = tables?.find(t => t.ID === tableId);
+                    pokerData.TableName = matchingTable?.name || `Table ${tableId}`;
+                }
+                
                 if (!message) return;
 
                 // Route based on event type
@@ -147,6 +157,7 @@ function handleGetState(messageobj) {
                 name: playername,
                 money: null,
                 vpipThisHand: false,
+                pfrThisHand: false,
                 actions: []
             };
 
@@ -165,7 +176,7 @@ function handleGetState(messageobj) {
                 round: pokerData.round || "Round 1",
                 timestamp: Date.now()
             });
-            
+
             player.money = (player.money || 0) - blind.amount;
 
             if (blind.type === "small") {
@@ -176,7 +187,7 @@ function handleGetState(messageobj) {
                 pokerData.bbAmount = blind.amount;
             }
 
-            console.log(`${player.name} posted ${blind.type} blind: -${blind.amount}`);
+            console.log(`${player.name} posted ${blind.type} blind: $${blind.amount}`);
         }
 
         // Clear the queue after applying
@@ -185,8 +196,6 @@ function handleGetState(messageobj) {
 
     updateHUDDisplay();
 }
-
-
 
 function handlePlayerAction(messageObj) {
     const chatData = messageObj.data;
@@ -203,6 +212,10 @@ function handlePlayerAction(messageObj) {
             const playerName = chatData.author;
             const match = message.match(/\$([\d,]+)/);
             const amount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.money = (playerEntry.money || 0) - amount;
+            }
 
             blindPosts.push({
                 type: "small",
@@ -215,6 +228,11 @@ function handlePlayerAction(messageObj) {
             const playerName = chatData.author;
             const match = message.match(/\$([\d,]+)/);
             const amount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+            const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
+            if (playerEntry) {
+                playerEntry.money = (playerEntry.money || 0) - amount;
+            }
+
 
             blindPosts.push({
                 type: "big",
@@ -224,9 +242,13 @@ function handlePlayerAction(messageObj) {
         }
 
         if (message.includes("raised $")) {
+            console.log(message);
             const playerName = chatData.author;
-            const match = message.match(/to\s+\$([\d,]+)/i);
-            const raiseTo = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+            let raiseTo = 0;
+            let match = message.match(/to\s+\$([\d,]+)/i); // Try "to $4096"
+            if (!match) match = message.match(/raised\s+\$([\d,]+)/i); // Fallback: "raised $4096"
+            raiseTo = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+            
 
             const playerEntry = Object.values(pokerData.players).find(p => p.name === playerName);
             if (playerEntry) {
@@ -241,7 +263,15 @@ function handlePlayerAction(messageObj) {
 
                 if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
                     playerEntry.vpipThisHand = true;
-                }                
+                }
+                if (pokerData.round === "Round 1" && !playerEntry.pfrThisHand) {
+                    playerEntry.pfrThisHand = true;
+                }
+
+                if (!playerEntry.aggressionStats) {
+                    playerEntry.aggressionStats = { bets: 0, raises: 0, calls: 0 };
+                } 
+                playerEntry.aggressionStats.raises++;               
 
                 console.log(`${playerName} raised to $${raiseTo}`);
             }
@@ -266,7 +296,12 @@ function handlePlayerAction(messageObj) {
                 if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
                     playerEntry.vpipThisHand = true;
                 }
-                
+
+                if (!playerEntry.aggressionStats) {
+                    playerEntry.aggressionStats = { bets: 0, raises: 0, calls: 0 };
+                } 
+                playerEntry.aggressionStats.calls++;    
+
                 console.log(`${playerName} called $${calledAmount}`);
             }
         }
@@ -290,7 +325,12 @@ function handlePlayerAction(messageObj) {
                 if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
                     playerEntry.vpipThisHand = true;
                 }
-                
+
+                if (!playerEntry.aggressionStats) {
+                    playerEntry.aggressionStats = { bets: 0, raises: 0, calls: 0 };
+                } 
+                playerEntry.aggressionStats.bets++;    
+
                 console.log(`${playerName} bet $${betAmount}`);
             }
         }
@@ -340,6 +380,7 @@ function handlePlayerAction(messageObj) {
                 playerEntry.money = (playerEntry.money || 0) + amount;
                 console.log(`${playerName} won $${amount}`);
             }
+            commitHandStatsToIndexedDB();
         }
     }
 }
@@ -446,6 +487,57 @@ function logPlayerActions() {
     console.log("──────────────────────────────");
 }
 
+async function commitHandStatsToIndexedDB() {
+    if (!pokerData.GameID) {
+        console.error("Invalid hand data: Missing GameID");
+        return;
+    }
+
+    console.log("Committing hand stats:", pokerData.players);
+
+    const dbOperations = Object.entries(pokerData.players)
+    .filter(([_, playerData]) => Array.isArray(playerData.actions) && playerData.actions.length > 0)
+    .map(async ([playerID, playerData]) => {
+        
+        const vpipIncrement = playerData.vpipThisHand ? 1 : 0;
+        const pfrIncrement = playerData.pfrThisHand ? 1 : 0;
+        const handNetProfit = playerData.money || 0;
+
+        try {
+            const playerIDString = String(playerID).trim();
+            console.log("Processing player:", playerIDString, playerData);
+            const existingRecord = await db.players.get(playerIDString);
+            await db.players.put({
+                id: playerIDString,  // Explicitly cast and trim
+                name: playerData.name,
+                handsPlayed: (existingRecord?.handsPlayed || 0) + 1,
+                vpipHands: (existingRecord?.vpipHands || 0) + vpipIncrement,
+                pfrHands: (existingRecord?.pfrHands || 0) + pfrIncrement,
+                netProfit: (existingRecord?.netProfit || 0) + handNetProfit,
+                lastPlayed: Date.now(),
+                GameID: pokerData.GameID,
+                TableID: pokerData.TableID,
+                aggressionStats: {
+                    bets: (existingRecord?.aggressionStats?.bets || 0) + (playerData.aggressionStats?.bets || 0),
+                    raises: (existingRecord?.aggressionStats?.raises || 0) + (playerData.aggressionStats?.raises || 0),
+                    calls: (existingRecord?.aggressionStats?.calls || 0) + (playerData.aggressionStats?.calls || 0),
+                },                
+            });
+        } catch (e) {
+            console.error(`Error updating player ${playerData.name} (${playerID}):`, e);
+        }
+    });
+
+    try {
+        await Promise.all(dbOperations);
+        console.log("IndexedDB updated successfully for all players this hand.");
+    } catch (e) {
+        console.error("Unexpected error committing hand stats:", e);
+    }
+
+}
+
+
 
 // Function to download pokerData as JSON
 function downloadPokerData() {
@@ -476,7 +568,7 @@ function initHUD() {
     hud.style.overflowY = "auto";
     hud.style.overflowX = "hidden";
 
-    hud.innerHTML = `<h3 style="margin-top: 0;">Poker HUD</h3><div id="hud-content">Loading...</div>`;
+    hud.innerHTML = `<h3 style="margin-top: 0;" id="hud-title">Loading table info...</h3><div id="hud-content">Loading...</div>`;
 
     // ✅ Append buttons
     hud.insertAdjacentHTML("beforeend", `
@@ -557,50 +649,219 @@ function initHUD() {
             background: #555;
             border-radius: 4px;
         }
+
+        #poker-hud .profit-positive {
+        color: #00e676; /* lime green */
+        font-weight: bold;
+        }
+        #poker-hud .profit-negative {
+            color: #ef5350; /* soft red */
+            font-weight: bold;
+        }
+        #poker-hud .vpip-nit {
+        color: #888; /* grey */
+        }
+        #poker-hud .vpip-tag {
+            color: #4caf50; /* green */
+            font-weight: bold;
+        }
+        #poker-hud .vpip-semi {
+            color: #fdd835; /* yellow */
+        }
+        #poker-hud .vpip-loose {
+            color: #ff9800; /* orange */
+        }
+        #poker-hud .vpip-maniac {
+            color: #ef5350; /* red */
+            font-weight: bold;
+        }
+        #poker-hud .pfr-good {
+            color: #4caf50; /* green */
+            font-weight: bold;
+        }
+        #poker-hud .pfr-okay {
+            color: #fdd835; /* yellow */
+        }
+        #poker-hud .pfr-passive {
+            color: #ef5350; /* red */
+        }
+        #poker-hud .pfr-overaggro {
+            color: #ff9800; /* orange */
+        }
+        #poker-hud .pfr-undefined {
+            color: #888; /* grey */
+        }
+        #poker-hud .af-zero {
+            color: #aaa; /* grey */
+        }
+        #poker-hud .af-passive {
+            color: #ef5350; /* red */
+        }
+        #poker-hud .af-balanced {
+            color: #4caf50; /* green */
+            font-weight: bold;
+        }
+        #poker-hud .af-aggressive {
+            color: #ff9800; /* orange */
+        }
+        #poker-hud .af-maniac {
+            color: #ab47bc; /* purple */
+        }
+        #poker-hud .af-infinite {
+            color: #00e5ff; /* cyan */
+            font-weight: bold;
+        }
+
+
     `;
     document.head.appendChild(style);
 }
 
-function updateHUDDisplay() {
+async function updateHUDDisplay() {
     const content = document.getElementById('hud-content');
-    if (!content) return;
+    if (!content || !pokerData.TableID) return;
 
-    const playerStats = pokerData.players;
-    const activeIDs = pokerData.activePlayerIDs || [];
+    const title = document.getElementById("hud-title");
+    if (title) {
+        const sb = pokerData.sbAmount !== null ? `$${formatCurrencyShort(pokerData.sbAmount)}` : "?";
+        const bb = pokerData.bbAmount !== null ? `$${formatCurrencyShort(pokerData.bbAmount)}` : "?";
+        const tableName = pokerData.TableName || `Table ${pokerData.TableID || '?'}`;
+        title.textContent = `${tableName} (${sb}/${bb})`;        
+    }
 
+
+    const playersOnTable = pokerData.seatedPlayerIDs;
+    if (!playersOnTable || playersOnTable.length === 0) {
+        content.innerHTML = "<i>No players seated.</i>";
+        return;
+    }
+
+    // Explicitly cast and trim IDs
+    const playerIDsAsStrings = playersOnTable.map(id => String(id).trim());
+
+    // Fetch all player records from IndexedDB
+    const playerRecords = await Promise.all(
+        playerIDsAsStrings.map(id => db.players.get({ id, TableID: pokerData.TableID }))
+    );
+    
     let html = "";
-    activeIDs.forEach(id => {
-        const p = playerStats[id];
-        if (!p) return;
+    playerRecords.forEach((record, index) => {
+        const playerID = playerIDsAsStrings[index];
+        const p = record || {
+            name: pokerData.players[playerID]?.name || 'Unknown',
+            handsPlayed: 0,
+            vpipHands: 0,
+            netProfit: 0,
+        };
 
         const hands = p.handsPlayed || 0;
-        const winnings = p.totalWinnings || 0;
-        const spent = p.totalSpent || 0;
-        const netWinnings = winnings - spent;
+        const vpipPercent = hands > 0 ? ((p.vpipHands / hands) * 100).toFixed(1) : "0.0";
+        const pfrPercent = hands > 0 ? ((p.pfrHands / hands) * 100).toFixed(1) : "0.0";
+        const netProfit = p.netProfit || 0;
+        const bbAmount = pokerData.bbAmount || 1; // prevent division by 0
+        const bbProfit = (netProfit / bbAmount).toFixed(1);
+        const bbDisplay = `(${bbProfit} BB)`;
+        const netDisplay = netProfit >= 0 
+        ? `+$${formatCurrencyShort(netProfit)} ${bbDisplay}`
+        : `-$${formatCurrencyShort(Math.abs(netProfit))} ${bbDisplay}`;    
+        const netClass = netProfit >= 0 ? 'profit-positive' : 'profit-negative';
+        const profileLink = `https://www.torn.com/profiles.php?XID=${playerID}`;
+        const attackLink = `https://www.torn.com/loader.php?sid=attack&user2ID=${playerID}`;
+        const aStats = p.aggressionStats || { bets: 0, raises: 0, calls: 0 };
+        const totalAggressive = aStats.bets + aStats.raises;
+        const calls = aStats.calls;
+        const af = calls === 0 ? (totalAggressive > 0 ? "∞" : "0") : (totalAggressive / calls).toFixed(2);
 
-        let displayWinnings, unit;
-        if (Math.abs(netWinnings) >= 1_000_000_000) {
-            displayWinnings = (netWinnings / 1_000_000_000).toFixed(2);
-            unit = "B";
-        } else {
-            displayWinnings = (netWinnings / 1_000_000).toFixed(2);
-            unit = "M";
-        }
-
-        const aggressionFactor = p.actions.call > 0 ? ((p.actions.bet + p.actions.raise) / p.actions.call).toFixed(2) : "∞";
-        const vpip = hands > 0 ? ((p.vpipHands / hands) * 100).toFixed(1) : "0.0";
-        const pfr = hands > 0 ? ((p.actions.raise / hands) * 100).toFixed(1) : "0.0";
-        const wtsd = hands > 0 ? ((p.showdownSeen / hands) * 100).toFixed(1) : "0.0";
-        const wsd = p.showdownSeen > 0 ? Math.min(((p.showdownWon / p.showdownSeen) * 100), 100).toFixed(1) : "0.0";
 
         html += `
         <div style="margin-bottom: 12px; border-bottom: 1px solid #555; padding-bottom: 8px;">
-            <strong>${p.name}</strong><br>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <span title="${getPlayerType(vpipPercent, pfrPercent, af)}" style="margin-right: 5px;">
+                        ${getPlayerType(vpipPercent, pfrPercent, af).split(" ")[0]}
+                    </span>
+                    <a href="${profileLink}" target="_blank" style="color: #4FC3F7; text-decoration: none; font-weight: bold;">
+                        ${p.name} [${playerID}]
+                    </a>
+                    <a href="${attackLink}" target="_blank" title="Attack Player" style="margin-left: 6px; text-decoration: none;">
+                        🗡️
+                    </a>
+                </div>
+                <div style="text-align: right; font-size: 14px; color: #ccc;">
+                    Hands: ${hands}
+                </div>
+            </div>
+            <div>
+            Net Profit: <span class="${netClass}">${netDisplay}</span>
+                <div style="display: flex; justify-content: space-between; font-family: monospace; margin-top: 4px;">
+                    <div style="text-align: left; width: 33%;">
+                        <span class="${getVPIPClass(parseFloat(vpipPercent))}">VPIP: ${vpipPercent}%</span>
+                    </div>
+                    <div style="text-align: center; width: 34%;">
+                        <span class="${getPFRClass(parseFloat(vpipPercent), parseFloat(pfrPercent))}">
+                            PFR: ${pfrPercent}%
+                        </span>
+                    </div>
+                    <div style="text-align: right; width: 33%;">
+                        <span class="${getAFClass(af)}">AF: ${af}</span>
+                    </div>
+                </div>
+            </div>
         </div>
     `;
+    
     });
 
-    content.innerHTML = html || "<i>Waiting for new round to start</i>";
+    content.innerHTML = html || "<i>Waiting for stats to populate...</i>";
+}
+
+function formatCurrencyShort(amount) {
+    if (amount >= 1_000_000_000) return `${(amount / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}b`;
+    if (amount >= 1_000_000) return `${(amount / 1_000_000).toFixed(1).replace(/\.0$/, '')}m`;
+    if (amount >= 1_000) return `${(amount / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+    return amount.toString();
+}
+
+function getVPIPClass(vpip) {
+    if (vpip >= 40) return "vpip-maniac";
+    if (vpip >= 30) return "vpip-loose";
+    if (vpip >= 20) return "vpip-semi";
+    if (vpip >= 10) return "vpip-tag";
+    return "vpip-nit";
+}
+
+function getPFRClass(vpip, pfr) {
+    if (vpip === 0) return "pfr-undefined"; // Prevent divide-by-zero
+    const ratio = (pfr / vpip) * 100;
+    if (ratio >= 70 && ratio <= 110) return "pfr-good";        // Green
+    if (ratio >= 60 && ratio < 70) return "pfr-okay";          // Yellow
+    if (ratio < 60) return "pfr-passive";                      // Red
+    if (ratio > 110) return "pfr-overaggro";                   // Orange
+    return "pfr-neutral";
+}
+
+function getAFClass(af) {
+    if (af === "∞") return "af-infinite";
+    const num = parseFloat(af);
+    if (isNaN(num)) return "af-undefined";
+    if (num === 0) return "af-zero";
+    if (num <= 1) return "af-passive";
+    if (num <= 3) return "af-balanced";
+    if (num <= 6) return "af-aggressive";
+    return "af-maniac";
+}
+
+function getPlayerType(vpip, pfr, af) {
+    const v = parseFloat(vpip);
+    const p = parseFloat(pfr);
+    const a = af === "∞" ? 99 : parseFloat(af); // handle infinite AF
+
+    if (v < 10 && p < 8 && a < 1.5) return "🪨 Nit : Very tight, rarely plays";
+    if (v >= 10 && v <= 22 && p >= 8 && p <= 20 && a >= 1.5 && a <= 3) return "🧠 TAG : Tight-Aggressive";
+    if (v > 22 && v <= 35 && p >= 18 && p <= 30 && a > 3) return "🧨 LAG : Loose-Aggressive";
+    if (v >= 35 && p > 25 && a > 4) return "🔥 Maniac : Hyper-aggressive, bluffy";
+    if (v >= 30 && p < 15 && a < 1.5) return "🐟 Fish : Loose-Passive, calling station";
+    return "🤔 Unknown";
 }
 
 function clearPokerData() {
