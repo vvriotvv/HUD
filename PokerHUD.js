@@ -15,6 +15,8 @@ const pokerData = {
     activePlayerIDs: [],
     communityCards: [],
     myCards: [],
+    preflopRaisers: [],
+    preflopRaiseCount: 0,
     GameID: null,
     TableID: null,
     TableName: null,
@@ -29,14 +31,15 @@ const pokerData = {
 const blindPosts = [];
 
 const db = new Dexie("PokerHUD");
-db.version(1).stores({
-    players: "&id, name, handsPlayed, vpipHands, pfrHands, netProfit, lastPlayed, GameID, TableID, [id+TableID]"
+db.version(3).stores({
+    players: "&id, name, handsPlayed, vpipHands, pfrHands, facedPFR,threeBetHands, fourBetHands, facedThreeBetHands, foldedToThreeBetHands, netProfit, lastPlayed, GameID, TableID, [id+TableID]"
 });
 
 (function () {
     'use strict';
 
     const OriginalWebSocket = window.WebSocket;
+
     function isJsonString(str) {
         try {
             const obj = JSON.parse(str);
@@ -52,27 +55,36 @@ db.version(1).stores({
         ws.addEventListener('message', function (event) {
             try {
                 const msg = event.data;
-                if (!isJsonString(msg)) return; // First, skip if it's not JSON
+                if (!isJsonString(msg)) return;
+
                 const data = JSON.parse(msg);
                 const channel = data?.push?.channel;
-                if (!channel || !channel.startsWith('holdem')) // Ensure channel exists and starts with 'holdem'
-                {
-                    return;
-                }
+                if (!channel || !channel.startsWith('holdem')) return;
 
                 const message = data?.push?.pub?.data?.message;
-                //console.log("WebSocket parsed:", data);
-                if (channel.startsWith('holdem') && !channel.includes('lobby')) {
-                    pokerData.TableID = channel.replace(/\D+/g, '');
+
+                // Detect table change
+                const isTableChannel = /^holdem\d+$/.test(channel);
+                if (isTableChannel) {
+                    const newTableID = channel.replace(/\D+/g, '');
+
+                    if (pokerData.TableID && pokerData.TableID !== newTableID) {
+                        console.log(`🪑 Table change detected! ${pokerData.TableID} ➡ ${newTableID}`);
+                        clearGameState();
+                    }
+
+                    pokerData.TableID = newTableID;
                 }
-                                if (channel.includes('holdemlobby')) {
+
+
+                // Get table name from lobby info
+                if (channel.includes('holdemlobby')) {
                     const tables = data?.push?.pub?.data?.message?.tables;
-                    const tableId = Number(pokerData.TableID); 
-                
-                    const matchingTable = tables?.find(t => t.ID === tableId);
-                    pokerData.TableName = matchingTable?.name || `Table ${tableId}`;
+                    const currentID = Number(pokerData.TableID);
+                    const matchingTable = tables?.find(t => t.ID === currentID);
+                    pokerData.TableName = matchingTable?.name || `Table ${currentID}`;
                 }
-                
+
                 if (!message) return;
 
                 // Route based on event type
@@ -82,14 +94,13 @@ db.version(1).stores({
                         break;
                     case "playerMakeMove":
                         break;
-                    case "chat": {
+                    case "chat":
                         const chat = message.data;
                         if (chat.meta === "action" || chat.meta === "won") {
                             handlePlayerAction(message);
                         } else if (chat.meta === "state") {
                             handleGameState(message);
                         }
-                    }
                         break;
                     default:
                         break;
@@ -119,6 +130,7 @@ db.version(1).stores({
     window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
 })();
 
+
 function handleGetState(messageobj) {
     //console.log(messageobj);
 
@@ -144,7 +156,7 @@ function handleGetState(messageobj) {
         });
 
         pokerData.myCards = formattedHand;
-        console.log("My Cards:", formattedHand.join(", "));
+        //console.log("My Cards:", formattedHand.join(", "));
     }
 
     if (messageobj.players && typeof messageobj.players === "object") {
@@ -164,7 +176,7 @@ function handleGetState(messageobj) {
             pokerData.seatedPlayerIDs.push(userID);
         }
 
-        console.log("Seated players:", pokerData.seatedPlayerIDs.map(id => pokerData.players[id].name).join(", "));
+        //console.log("Seated players:", pokerData.seatedPlayerIDs.map(id => pokerData.players[id].name).join(", "));
 
         for (const blind of blindPosts) {
             const player = Object.values(pokerData.players).find(p => p.name === blind.playerName);
@@ -261,11 +273,22 @@ function handlePlayerAction(messageObj) {
 
                 playerEntry.money = (playerEntry.money || 0) - raiseTo;
 
-                if (pokerData.round === "Round 1" && !playerEntry.vpipThisHand) {
+                if (pokerData.round === "Round 1") {
+                    pokerData.preflopRaiseCount++;
                     playerEntry.vpipThisHand = true;
-                }
-                if (pokerData.round === "Round 1" && !playerEntry.pfrThisHand) {
-                    playerEntry.pfrThisHand = true;
+                    if (pokerData.preflopRaiseCount === 1) {
+                        playerEntry.pfrThisHand = true;
+                    } else if (pokerData.preflopRaiseCount === 2) {
+                        playerEntry.threeBetThisHand = true;
+                        console.log(`${playerName} made a 3-bet!`);
+                    } else if (pokerData.preflopRaiseCount === 3) {
+                        playerEntry.fourBetThisHand = true;
+                        console.log(`${playerName} made a 4-bet!`);
+                    }
+                
+                    if (!pokerData.preflopRaisers.includes(playerName)) {
+                        pokerData.preflopRaisers.push(playerName);
+                    }
                 }
 
                 if (!playerEntry.aggressionStats) {
@@ -273,11 +296,12 @@ function handlePlayerAction(messageObj) {
                 } 
                 playerEntry.aggressionStats.raises++;               
 
-                console.log(`${playerName} raised to $${raiseTo}`);
+                //console.log(`${playerName} raised to $${raiseTo}`);
             }
         }
 
         if (message.includes("called $")) {
+            console.log(message);
             const playerName = chatData.author;
             const match = message.match(/\$([\d,]+)/);
             const calledAmount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
@@ -302,11 +326,12 @@ function handlePlayerAction(messageObj) {
                 } 
                 playerEntry.aggressionStats.calls++;    
 
-                console.log(`${playerName} called $${calledAmount}`);
+                //console.log(`${playerName} called $${calledAmount}`);
             }
         }
 
         if (message.includes("bet $")) {
+            console.log(message);
             const playerName = chatData.author;
             const match = message.match(/\$([\d,]+)/);
             const betAmount = match ? parseInt(match[1].replace(/,/g, '')) : 0;
@@ -331,7 +356,7 @@ function handlePlayerAction(messageObj) {
                 } 
                 playerEntry.aggressionStats.bets++;    
 
-                console.log(`${playerName} bet $${betAmount}`);
+                //console.log(`${playerName} bet $${betAmount}`);
             }
         }
 
@@ -345,7 +370,7 @@ function handlePlayerAction(messageObj) {
                     round: pokerData.round,
                     timestamp: Date.now()
                 });
-                console.log(`${playerName} folded`);
+                //console.log(`${playerName} folded`);
             }
         }
 
@@ -359,10 +384,11 @@ function handlePlayerAction(messageObj) {
                     round: pokerData.round,
                     timestamp: Date.now()
                 });
-                console.log(`${playerName} checked`);
+                //console.log(`${playerName} checked`);
             }
         }
     } else if (chatData.meta.includes("won")) {
+        console.log(message);
         if (message.includes("won $")) {
             const playerName = chatData.author;
             const match = message.match(/\$([\d,]+)/);
@@ -378,7 +404,7 @@ function handlePlayerAction(messageObj) {
                 });
 
                 playerEntry.money = (playerEntry.money || 0) + amount;
-                console.log(`${playerName} won $${amount}`);
+                //console.log(`${playerName} won $${amount}`);
             }
             commitHandStatsToIndexedDB();
         }
@@ -423,7 +449,7 @@ function handleGameState(messageObj) {
     }
 
     if (message.includes("reveals")) {
-        console.log(author, message);
+        //console.log(author, message);
         return;
     }
 
@@ -441,7 +467,7 @@ function handleGameState(messageObj) {
 
 // Refresh Data for new round
 function clearGameState() {
-    logPlayerActions();
+    //logPlayerActions();
 
     pokerData.round = null;
     pokerData.GameID = null;
@@ -449,6 +475,8 @@ function clearGameState() {
     pokerData.seatedPlayerIDs = [];
     pokerData.activePlayerIDs = [];
     pokerData.communityCards = [];
+    pokerData.preflopRaisers = [];
+    pokerData.preflopRaiseCount = 0;
     pokerData.myCards = [];
     pokerData.sbAmount = null;
     pokerData.sbPlayerName = null;
@@ -501,22 +529,75 @@ async function commitHandStatsToIndexedDB() {
         
         const vpipIncrement = playerData.vpipThisHand ? 1 : 0;
         const pfrIncrement = playerData.pfrThisHand ? 1 : 0;
+        const fourBetIncrement = playerData.fourBetThisHand ? 1 : 0;
         const handNetProfit = playerData.money || 0;
+
+        let faced3B = false;
+        let foldedTo3B = false;
+        let facedPFRIncrement = 0;
+        let threeBetIncrement = 0;
+
+        const playerActions = playerData.actions || [];
+        const preflopActions = playerActions.filter(a => a.round === "Round 1");
+
+        const allPreflopRaises = pokerData.seatedPlayerIDs
+            .map(id => {
+                const player = pokerData.players[id];
+                const raise = player?.actions?.find(a => a.type === "raise" && a.round === "Round 1");
+                return raise ? { id, name: player.name, timestamp: raise.timestamp } : null;
+            })
+            .filter(r => r !== null)
+            .sort((a, b) => a.timestamp - b.timestamp);
+
+        const playerPreflopRaise = preflopActions.find(a => a.type === "raise");
+
+        if (playerPreflopRaise) {
+            const isFirstRaiser = allPreflopRaises[0]?.name === playerData.name;
+
+            if (!isFirstRaiser) {
+                facedPFRIncrement = 1;
+                threeBetIncrement = 1;
+            }
+
+            if (isFirstRaiser && allPreflopRaises.length >= 2) {
+                faced3B = true;
+                const foldedPreflop = playerData.actions.some(a => a.type === "folded" && a.round === "Round 1");
+                if (foldedPreflop) {
+                    foldedTo3B = true;
+                }
+            }
+        } else {
+            const firstAction = preflopActions[0];
+            if (firstAction && allPreflopRaises.length > 0 && firstAction.timestamp > allPreflopRaises[0].timestamp) {
+                facedPFRIncrement = 1;
+            }
+        }
+        if (playerData.fourBetThisHand && !faced3B) {
+            //cold 4bet
+            faced3B = true;
+        } else if (playerData.fourBetThisHand && faced3B) {
+            fourBetIncrement = 1;
+        }
 
         try {
             const playerIDString = String(playerID).trim();
-            console.log("Processing player:", playerIDString, playerData);
-            const existingRecord = await db.players.get(playerIDString);
+            const existingRecord = await db.players.where('[id+TableID]').equals([playerIDString, pokerData.TableID]).first();
+
             await db.players.put({
-                id: playerIDString,  // Explicitly cast and trim
+                id: playerIDString,  
+                TableID: pokerData.TableID,
                 name: playerData.name,
                 handsPlayed: (existingRecord?.handsPlayed || 0) + 1,
                 vpipHands: (existingRecord?.vpipHands || 0) + vpipIncrement,
                 pfrHands: (existingRecord?.pfrHands || 0) + pfrIncrement,
+                threeBetHands: (existingRecord?.threeBetHands || 0) + threeBetIncrement,
+                fourBetHands: (existingRecord?.fourBetHands || 0) + fourBetIncrement,
+                facedPFR: (existingRecord?.facedPFR || 0) + facedPFRIncrement,
+                facedThreeBetHands: (existingRecord?.facedThreeBetHands || 0) + (faced3B ? 1 : 0),
+                foldedToThreeBetHands: (existingRecord?.foldedToThreeBetHands || 0) + (foldedTo3B ? 1 : 0),
                 netProfit: (existingRecord?.netProfit || 0) + handNetProfit,
                 lastPlayed: Date.now(),
                 GameID: pokerData.GameID,
-                TableID: pokerData.TableID,
                 aggressionStats: {
                     bets: (existingRecord?.aggressionStats?.bets || 0) + (playerData.aggressionStats?.bets || 0),
                     raises: (existingRecord?.aggressionStats?.raises || 0) + (playerData.aggressionStats?.raises || 0),
@@ -534,10 +615,7 @@ async function commitHandStatsToIndexedDB() {
     } catch (e) {
         console.error("Unexpected error committing hand stats:", e);
     }
-
 }
-
-
 
 // Function to download pokerData as JSON
 function downloadPokerData() {
@@ -692,7 +770,7 @@ function initHUD() {
             color: #888; /* grey */
         }
         #poker-hud .af-zero {
-            color: #aaa; /* grey */
+            color: #888; /* grey */
         }
         #poker-hud .af-passive {
             color: #ef5350; /* red */
@@ -711,8 +789,61 @@ function initHUD() {
             color: #00e5ff; /* cyan */
             font-weight: bold;
         }
-
-
+            #poker-hud .threeb-nit {
+            color: #888; /* grey */
+        }
+        #poker-hud .threeb-standard {
+            color: #4caf50; /* green */
+            font-weight: bold;
+        }
+        #poker-hud .threeb-aggro {
+            color: #ff9800; /* orange */
+        }
+        #poker-hud .threeb-maniac {
+            color: #ef5350; /* red */
+            font-weight: bold;
+        }
+        #poker-hud .threeb-undefined {
+            color: #888; /* fallback grey */
+        }
+            #poker-hud .fourb-nit {
+            color: #aaa;
+        }
+        #poker-hud .fourb-solid {
+            color: #4caf50;
+            font-weight: bold;
+        }
+        #poker-hud .fourb-aggro {
+            color: #ff9800;
+        }
+        #poker-hud .fourb-maniac {
+            color: #ef5350;
+            font-weight: bold;
+        }
+        #poker-hud .fourb-undefined {
+            color: #888;
+        }
+        #poker-hud .f3b-undefined {
+            color: #aaa; /* light grey */
+        }
+        #poker-hud .f3b-foldy {
+            color: #ccc; /* dull grey */
+        }
+        #poker-hud .f3b-tight {
+            color: #ef5350; /* red */
+            font-weight: bold;
+        }
+        #poker-hud .f3b-balanced {
+            color: #4caf50; /* green */
+            font-weight: bold;
+        }
+        #poker-hud .f3b-sticky {
+            color: #ff9800; /* orange */
+        }
+        #poker-hud .f3b-aggro {
+            color: #ab47bc; /* purple */
+            font-weight: bold;
+        }
     `;
     document.head.appendChild(style);
 }
@@ -741,8 +872,14 @@ async function updateHUDDisplay() {
 
     // Fetch all player records from IndexedDB
     const playerRecords = await Promise.all(
-        playerIDsAsStrings.map(id => db.players.get({ id, TableID: pokerData.TableID }))
+        playerIDsAsStrings.map(async id => {
+            return await db.players
+                .where('[id+TableID]')
+                .equals([id, pokerData.TableID])
+                .first();
+        })
     );
+    
     
     let html = "";
     playerRecords.forEach((record, index) => {
@@ -757,6 +894,11 @@ async function updateHUDDisplay() {
         const hands = p.handsPlayed || 0;
         const vpipPercent = hands > 0 ? ((p.vpipHands / hands) * 100).toFixed(1) : "0.0";
         const pfrPercent = hands > 0 ? ((p.pfrHands / hands) * 100).toFixed(1) : "0.0";
+        const threeBetPercent = p.facedPFR > 0 ? ((p.threeBetHands / p.facedPFR) * 100).toFixed(1) : "0.0";
+        const fourBetPercent = p.facedThreeBetHands > 0 ? ((p.fourBetHands || 0) / p.facedThreeBetHands * 100).toFixed(1) : "0.0";
+        const f3bPercent = (p.facedThreeBetHands > 0)
+        ? ((p.foldedToThreeBetHands / p.facedThreeBetHands) * 100).toFixed(1)
+        : "0.0%";
         const netProfit = p.netProfit || 0;
         const bbAmount = pokerData.bbAmount || 1; // prevent division by 0
         const bbProfit = (netProfit / bbAmount).toFixed(1);
@@ -774,7 +916,7 @@ async function updateHUDDisplay() {
 
 
         html += `
-        <div style="margin-bottom: 12px; border-bottom: 1px solid #555; padding-bottom: 8px;">
+        <div style="padding: 10px 0; border-bottom: 1px solid #555; margin-bottom: 10px;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <div>
                     <span title="${getPlayerType(vpipPercent, pfrPercent, af)}" style="margin-right: 5px;">
@@ -792,24 +934,39 @@ async function updateHUDDisplay() {
                 </div>
             </div>
             <div>
-            Net Profit: <span class="${netClass}">${netDisplay}</span>
-                <div style="display: flex; justify-content: space-between; font-family: monospace; margin-top: 4px;">
-                    <div style="text-align: left; width: 33%;">
-                        <span class="${getVPIPClass(parseFloat(vpipPercent))}">VPIP: ${vpipPercent}%</span>
+                Net Profit: <span class="${netClass}">${netDisplay}</span>
+                <div style="font-family: monospace; margin-top: 4px;">
+                    <!-- First row: VPIP, PFR, AF -->
+                    <div style="display: flex; justify-content: space-between;">
+                        <div style="width: 33%; text-align: left;">
+                            <span class="${getVPIPClass(parseFloat(vpipPercent))}">VPIP: ${vpipPercent}%</span>
+                        </div>
+                        <div style="width: 33%; text-align: center;">
+                            <span class="${getPFRClass(parseFloat(vpipPercent), parseFloat(pfrPercent))}">
+                                PFR: ${pfrPercent}%
+                            </span>
+                        </div>
+                        <div style="width: 33%; text-align: right;">
+                            <span class="${getAFClass(af)}">AF: ${af}</span>
+                        </div>
                     </div>
-                    <div style="text-align: center; width: 34%;">
-                        <span class="${getPFRClass(parseFloat(vpipPercent), parseFloat(pfrPercent))}">
-                            PFR: ${pfrPercent}%
-                        </span>
-                    </div>
-                    <div style="text-align: right; width: 33%;">
-                        <span class="${getAFClass(af)}">AF: ${af}</span>
+
+                    <!-- Second row: 3B, 4B, F3B -->
+                    <div style="display: flex; justify-content: space-between; margin-top: 2px;">
+                        <div style="width: 33%; text-align: left;">
+                            <span class="${getThreeBetClass(threeBetPercent)}">3B: ${threeBetPercent}%</span>
+                        </div>
+                        <div style="width: 33%; text-align: center;">
+                            <span class="${getFourBetClass(fourBetPercent)}">4B: ${fourBetPercent}%</span>
+                        </div>
+                        <div style="width: 33%; text-align: right;">
+                            <span class="${getF3BClass(f3bPercent)}">F3B: ${f3bPercent}%</span>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
-    `;
-    
+        `;
     });
 
     content.innerHTML = html || "<i>Waiting for stats to populate...</i>";
@@ -850,6 +1007,35 @@ function getAFClass(af) {
     if (num <= 6) return "af-aggressive";
     return "af-maniac";
 }
+
+function getThreeBetClass(threeBetPercent) {
+    const pct = parseFloat(threeBetPercent);
+    if (isNaN(pct)) return "threeb-undefined";
+    if (pct < 3) return "threeb-nit";          // Grey
+    if (pct < 6) return "threeb-standard";     // Green
+    if (pct < 10) return "threeb-aggro";       // Yellow/Orange
+    return "threeb-maniac";                    // Red
+}
+
+function getFourBetClass(fourBetPercent) {
+    const pct = parseFloat(fourBetPercent);
+    if (isNaN(pct)) return "fourb-undefined";
+    if (pct < 1.5) return "fourb-nit";          // Grey
+    if (pct < 3) return "fourb-solid";          // Green
+    if (pct < 5) return "fourb-aggro";          // Orange
+    return "fourb-maniac";                      // Red
+}
+
+function getF3BClass(f3bPercent) {
+    const pct = parseFloat(f3bPercent);
+    if (isNaN(pct)) return "f3b-undefined";
+    if (pct > 80) return "f3b-foldy";         // Grey
+    if (pct > 60) return "f3b-tight";          // Red
+    if (pct > 40) return "f3b-balanced";       // Green
+    if (pct > 20) return "f3b-sticky";         // Orange
+    return "f3b-aggro";                        // Purple
+}
+
 
 function getPlayerType(vpip, pfr, af) {
     const v = parseFloat(vpip);
@@ -900,9 +1086,23 @@ setInterval(() => {
     saveHUDData();
 }, 3000);
 
+async function requestPersistentStorage() {
+    if (navigator.storage && navigator.storage.persist) {
+        const isPersisted = await navigator.storage.persisted();
+        if (!isPersisted) {
+            const granted = await navigator.storage.persist();
+            console.log(granted ? "✅ Persistent storage granted." : "❌ Persistent storage denied.");
+        } else {
+            console.log("📦 Already using persistent storage.");
+        }
+    } else {
+        console.warn("⚠️ Persistent storage API not supported.");
+    }
+}
 
 // Run on page load
 window.addEventListener("load", () => {
     initHUD();
     loadHUDData();
+    requestPersistentStorage();
 });
